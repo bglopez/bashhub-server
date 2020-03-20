@@ -20,6 +20,8 @@ package internal
 
 import (
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -42,15 +44,14 @@ type User struct {
 }
 
 type Query struct {
-	Uuid       string `json:"uuid"`
-	Command    string `json:"command"`
-	Created    int64  `json:"created"`
-	Path       string `json:"path"`
-	ExitStatus int    `json:"exitStatus"`
-	Username   string `json:"username"`
-	SystemName string `gorm:"-"  json:"systemName"`
-	//TODO: implement sessions
-	SessionID string `json:"session_id"`
+	Command    string  `json:"command"`
+	Path       string  `json:"path"`
+	Created    int64   `json:"created"`
+	Uuid       string  `json:"uuid"`
+	ExitStatus int     `json:"exitStatus"`
+	Username   string  `json:"username"`
+	SystemName string  `gorm:"-"  json:"systemName"`
+	SessionID  *string `json:"sessionId"`
 }
 
 type Command struct {
@@ -67,6 +68,7 @@ type Command struct {
 	Limit            int    `gorm:"-"`
 	Unique           bool   `gorm:"-"`
 	Query            string `gorm:"-"`
+	SessionID        string `json:"sessionId"`
 }
 
 type System struct {
@@ -81,46 +83,60 @@ type System struct {
 	UserId        uint    `json:"userId"`
 }
 
-var (
-	// Addr is the listen and server address for our server (gin)
-	Addr string
-	// LogFile is the log file location for http logging. Default is stderr.
-	LogFile string
-)
+type Status struct {
+	User                 `json:"-"`
+	ProcessID            int    `json:"-"`
+	Username             string `json:"username"`
+	TotalCommands        int    `json:"totalCommands"`
+	TotalSessions        int    `json:"totalSessions"`
+	TotalSystems         int    `json:"totalSystems"`
+	TotalCommandsToday   int    `json:"totalCommandsToday"`
+	SessionName          string `json:"sessionName"`
+	SessionStartTime     int64  `json:"sessionStartTime"`
+	SessionTotalCommands int    `json:"sessionTotalCommands"`
+}
 
-//TODO: Figure out a better way to do this.
-const secret = "bashub-server-secret"
+type Config struct {
+	Secret  string
+	ID      int
+	Created time.Time
+}
 
-func getLog() *os.File {
+type Import Query
 
-	if LogFile != "" {
-		f, err := os.Create(LogFile)
+var config Config
+
+func getLog(logFile string) io.Writer {
+	switch {
+	case logFile == "/dev/null":
+		return ioutil.Discard
+	case logFile != "":
+		f, err := os.Create(logFile)
 		if err != nil {
 			log.Fatal(err)
 		}
 		return f
+	default:
+		return os.Stderr
 	}
-	return os.Stderr
 }
 
-// LoggerWithFormatter instance a Logger middleware with the specified log format function.
-func loggerWithFormatterWriter(f gin.LogFormatter) gin.HandlerFunc {
+// loggerWithFormatterWriter instance a Logger middleware with the specified log format function.
+func loggerWithFormatterWriter(logFile string, f gin.LogFormatter) gin.HandlerFunc {
 	return gin.LoggerWithConfig(gin.LoggerConfig{
 		Formatter: f,
-		Output:    getLog(),
+		Output:    getLog(logFile),
 	})
 }
 
-// Run starts server
-func Run() {
-	// Initialize backend
-	dbInit()
-
+// configure routes and middleware
+func setupRouter(dbPath string, logFile string) *gin.Engine {
+	dbInit(dbPath)
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
 
-	r.Use(loggerWithFormatterWriter(func(param gin.LogFormatterParams) string {
+	r.Use(loggerWithFormatterWriter(logFile, func(param gin.LogFormatterParams) string {
 		return fmt.Sprintf("[BASHHUB-SERVER] %v | %3d | %13v | %15s | %-7s  %s\n",
 			param.TimeStamp.Format("2006/01/02 - 15:04:05"),
 			param.StatusCode,
@@ -134,7 +150,7 @@ func Run() {
 	// the jwt middleware
 	authMiddleware, err := jwt.New(&jwt.GinJWTMiddleware{
 		Realm:       "bashhub-server zone",
-		Key:         []byte(secret),
+		Key:         []byte(config.getSecret()),
 		Timeout:     10000 * time.Hour,
 		MaxRefresh:  10000 * time.Hour,
 		IdentityKey: "username",
@@ -148,15 +164,25 @@ func Run() {
 				return jwt.MapClaims{
 					"username":   v.Username,
 					"systemName": v.SystemName,
+					"user_id":    v.ID,
 				}
 			}
 			return jwt.MapClaims{}
 		},
 		IdentityHandler: func(c *gin.Context) interface{} {
 			claims := jwt.ExtractClaims(c)
+			var id uint
+			switch claims["user_id"].(type) {
+			case float64:
+				id = uint(claims["user_id"].(float64))
+
+			default:
+				id = claims["user_id"].(uint)
+			}
 			return &User{
 				Username:   claims["username"].(string),
 				SystemName: claims["systemName"].(string),
+				ID:         id,
 			}
 		},
 		Authenticator: func(c *gin.Context) (interface{}, error) {
@@ -169,6 +195,7 @@ func Run() {
 				return &User{
 					Username:   user.Username,
 					SystemName: user.userGetSystemName(),
+					ID:         user.userGetID(),
 				}, nil
 			}
 			fmt.Println("failed")
@@ -232,8 +259,13 @@ func Run() {
 		var command Command
 		var user User
 		claims := jwt.ExtractClaims(c)
-		user.Username = claims["username"].(string)
-		command.User.ID = user.userGetId()
+		switch claims["user_id"].(type) {
+		case float64:
+			command.User.ID = uint(claims["user_id"].(float64))
+
+		default:
+			command.User.ID = claims["user_id"].(uint)
+		}
 
 		if c.Param("path") == "search" {
 			command.Limit = 100
@@ -244,25 +276,33 @@ func Run() {
 					command.Limit = num
 				}
 			}
+			command.Unique = false
 			if c.Query("unique") == "true" {
 				command.Unique = true
-			} else {
-				command.Unique = false
 			}
 			command.Path = c.Query("path")
 			command.Query = c.Query("query")
 			command.SystemName = c.Query("systemName")
 
-			result := command.commandGet()
-			if len(result) == 0 {
-				c.JSON(http.StatusOK, gin.H{})
+			result, err := command.commandGet()
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return
 			}
-			c.IndentedJSON(http.StatusOK, result)
+			if len(result) != 0 {
+				c.IndentedJSON(http.StatusOK, result)
+				return
+			} else {
+				c.JSON(http.StatusOK, gin.H{})
+			}
+
 		} else {
 			command.Uuid = c.Param("path")
-			command.User.ID = user.userGetId()
-			result := command.commandGetUUID()
+			result, err := command.commandGetUUID()
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
 			result.Username = user.Username
 			c.IndentedJSON(http.StatusOK, result)
 		}
@@ -275,25 +315,54 @@ func Run() {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		var user User
+		if command.ExitStatus != 0 && command.ExitStatus != 130 {
+			return
+		}
 		claims := jwt.ExtractClaims(c)
-		user.Username = claims["username"].(string)
-		command.User.ID = user.userGetId()
+		switch claims["user_id"].(type) {
+		case float64:
+			command.User.ID = uint(claims["user_id"].(float64))
+
+		default:
+			command.User.ID = claims["user_id"].(uint)
+		}
+
 		command.SystemName = claims["systemName"].(string)
 		command.commandInsert()
+		c.AbortWithStatus(http.StatusOK)
+	})
+
+	r.DELETE("/api/v1/command/:uuid", func(c *gin.Context) {
+		var command Command
+		claims := jwt.ExtractClaims(c)
+		switch claims["user_id"].(type) {
+		case float64:
+			command.User.ID = uint(claims["user_id"].(float64))
+
+		default:
+			command.User.ID = claims["user_id"].(uint)
+		}
+		command.Uuid = c.Param("uuid")
+		command.commandDelete()
+		c.AbortWithStatus(http.StatusOK)
+
 	})
 
 	r.POST("/api/v1/system", func(c *gin.Context) {
 		var system System
-		var user User
 		err := c.Bind(&system)
 		if err != nil {
-			log.Fatal(err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
 		}
-
 		claims := jwt.ExtractClaims(c)
-		user.Username = claims["username"].(string)
-		system.User.ID = user.userGetId()
+		switch claims["user_id"].(type) {
+		case float64:
+			system.User.ID = uint(claims["user_id"].(float64))
+
+		default:
+			system.User.ID = claims["user_id"].(uint)
+		}
 
 		system.systemInsert()
 		c.AbortWithStatus(201)
@@ -301,28 +370,114 @@ func Run() {
 
 	r.GET("/api/v1/system", func(c *gin.Context) {
 		var system System
-		var user User
 		claims := jwt.ExtractClaims(c)
+		switch claims["user_id"].(type) {
+		case float64:
+			system.User.ID = uint(claims["user_id"].(float64))
+
+		default:
+			system.User.ID = claims["user_id"].(uint)
+		}
 		mac := c.Query("mac")
 		if mac == "" {
 			c.AbortWithStatus(http.StatusBadRequest)
 			return
 		}
-		user.Username = claims["username"].(string)
-		system.User.ID = user.userGetId()
-		result := system.systemGet()
-		if len(result.Mac) == 0 {
-			c.AbortWithStatus(404)
+		system.Mac = mac
+		result, err := system.systemGet()
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 		c.IndentedJSON(http.StatusOK, result)
 
 	})
 
-	Addr = strings.ReplaceAll(Addr, "http://", "")
-	err = r.Run(Addr)
-	
+	r.PATCH("/api/v1/system/:mac", func(c *gin.Context) {
+		var system System
+		err := c.Bind(&system)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		claims := jwt.ExtractClaims(c)
+		switch claims["user_id"].(type) {
+		case float64:
+			system.User.ID = uint(claims["user_id"].(float64))
+
+		default:
+			system.User.ID = claims["user_id"].(uint)
+		}
+		system.Mac = c.Param("mac")
+		system.systemUpdate()
+		c.AbortWithStatus(http.StatusOK)
+	})
+
+	r.GET("/api/v1/client-view/status", func(c *gin.Context) {
+		var status Status
+		claims := jwt.ExtractClaims(c)
+		switch claims["user_id"].(type) {
+		case float64:
+			status.User.ID = uint(claims["user_id"].(float64))
+
+		default:
+			status.User.ID = claims["user_id"].(uint)
+		}
+
+		status.SessionName = c.Query("processId")
+		t, err := strconv.Atoi(c.Query("startTime"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		status.SessionStartTime = int64(t)
+
+		pid, err := strconv.Atoi(c.Query("processId"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		status.ProcessID = pid
+
+		result, err := status.statusGet()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		c.IndentedJSON(http.StatusOK, result)
+	})
+
+	r.POST("/api/v1/import", func(c *gin.Context) {
+		var imp Import
+		if err := c.ShouldBindJSON(&imp); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		claims := jwt.ExtractClaims(c)
+		user := claims["username"].(string)
+		imp.Username = user
+		err = importCommands(imp)
+		if err != nil {
+			log.Println(err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		c.AbortWithStatus(http.StatusOK)
+	})
+
+	return r
+}
+
+// Run starts server
+func Run(dbFile string, logFile string, addr string) {
+	r := setupRouter(dbFile, logFile)
+
+	addr = strings.ReplaceAll(addr, "http://", "")
+	err := r.Run(addr)
+
 	if err != nil {
 		fmt.Println("Error: \t", err)
 	}
+
 }

@@ -22,27 +22,36 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"runtime"
+	"runtime/pprof"
+	"runtime/trace"
 	"strings"
+	"syscall"
 
 	"github.com/fatih/color"
 	"github.com/nicksherron/bashhub-server/internal"
 	"github.com/spf13/cobra"
 )
 
-var cfgFile string
-
 // rootCmd represents the base command when called without any subcommands
 var (
-	noWarning bool
-	rootCmd   = &cobra.Command{
+	logFile      string
+	dbPath       string
+	addr         string
+	traceProfile = os.Getenv("BH_SERVER_DEBUG_TRACE")
+	cpuProfile   = os.Getenv("BH_SERVER_DEBUG_CPU")
+	memProfile   = os.Getenv("BH_SERVER_DEBUG_MEM")
+	rootCmd      = &cobra.Command{
 		Run: func(cmd *cobra.Command, args []string) {
 			cmd.Flags().Parse(args)
-			if !noWarning {
-				checkBhEnv()
-			}
+			checkBhEnv()
 			startupMessage()
-			internal.Run()
+			if cpuProfile != "" || memProfile != "" || traceProfile != "" {
+				profileInit()
+			}
+			internal.Run(dbPath, logFile, addr)
 		},
 	}
 )
@@ -57,10 +66,9 @@ func Execute() {
 
 func init() {
 	cobra.OnInitialize()
-	rootCmd.PersistentFlags().StringVar(&internal.LogFile, "log", "", `Set filepath for HTTP log. "" logs to stderr`)
-	rootCmd.PersistentFlags().StringVar(&internal.DbPath, "db", dbPath(), "DB location (sqlite or postgres)")
-	rootCmd.PersistentFlags().StringVarP(&internal.Addr, "addr", "a", listenAddr(), "Ip and port to listen and serve on")
-	rootCmd.PersistentFlags().BoolVarP(&noWarning, "warning-disable", "w", false, `Disable BH_URL env variable startup warning`)
+	rootCmd.PersistentFlags().StringVar(&logFile, "log", "", `Set filepath for HTTP log. "" logs to stderr`)
+	rootCmd.PersistentFlags().StringVar(&dbPath, "db", sqlitePath(), "db location (sqlite or postgres)")
+	rootCmd.PersistentFlags().StringVarP(&addr, "addr", "a", listenAddr(), "Ip and port to listen and serve on")
 
 }
 
@@ -78,11 +86,9 @@ func startupMessage() {
 \__ \  __/ |   \ V /  __/ |              
 |___/\___|_|    \_/ \___|_|              
                                                                                   
-`, Version, internal.Addr)
+`, Version, addr)
 	color.HiGreen(banner)
-	fmt.Print("\n")
-	log.Printf("Listening and serving HTTP on %v", internal.Addr)
-	fmt.Print("\n")
+	log.Printf("\nListening and serving HTTP on %v\n", addr)
 }
 
 func listenAddr() string {
@@ -96,7 +102,7 @@ func listenAddr() string {
 
 }
 
-func dbPath() string {
+func sqlitePath() string {
 	dbFile := "data.db"
 	f := filepath.Join(appDir(), dbFile)
 	return f
@@ -122,7 +128,55 @@ func checkBhEnv() {
 		msg := fmt.Sprintf(`
 WARNING: BH_URL is set to https://bashhub.com on this machine
 If you will be running bashhub-client locally be sure to add
-export BH_URL=%v to your .bashrc or .zshrc`, internal.Addr)
-		fmt.Println(msg, "\n")
+export BH_URL=%v to your .bashrc or .zshrc`, addr)
+		fmt.Println(msg)
 	}
+}
+
+func profileInit() {
+
+	go func() {
+		defer os.Exit(1)
+		if traceProfile != "" {
+			f, err := os.Create(traceProfile)
+			if err != nil {
+				log.Fatal("could not create trace profile: ", err)
+			}
+			defer f.Close()
+			if err := trace.Start(f); err != nil {
+				log.Fatal("could not start trace profile: ", err)
+			}
+			defer trace.Stop()
+		}
+
+		if cpuProfile != "" {
+			f, err := os.Create(cpuProfile)
+			if err != nil {
+				log.Fatal("could not create CPU profile: ", err)
+			}
+			defer f.Close()
+			if err := pprof.StartCPUProfile(f); err != nil {
+				log.Fatal("could not start CPU profile: ", err)
+			}
+			defer pprof.StopCPUProfile()
+		}
+
+		defer func() {
+			if memProfile != "" {
+				mf, err := os.Create(memProfile)
+				if err != nil {
+					log.Fatal("could not create memory profile: ", err)
+				}
+				defer mf.Close()
+				runtime.GC() // get up-to-date statistics
+				if err := pprof.WriteHeapProfile(mf); err != nil {
+					log.Fatal("could not write memory profile: ", err)
+				}
+			}
+		}()
+
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+		<-sigs
+	}()
 }
